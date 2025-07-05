@@ -1,226 +1,64 @@
-name: Deploy to LocalStack ECR and Kind
+name: Deploy to ECR
 
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-
-env:
-  DOCKER_IMAGE_NAME: app-inmobiliaria
-  AWS_DEFAULT_REGION: us-east-1
-  LOCALSTACK_ENDPOINT: http://localhost:4566
 
 jobs:
-  # Primer job: Construir y publicar la imagen en DockerHub
-  build-and-push-dockerhub:
-    runs-on: ubuntu-latest
-    outputs:
-      image-digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - name: Checkout del repositorio
-        uses: actions/checkout@v4
+    build-and-deploy:
+      runs-on: ubuntu-latest
+      
+      services:
+        localstack:
+          image: localstack/localstack-pro:latest
+          env:
+            LOCALSTACK_API_KEY: ${{ secrets.LOCALSTACK_API_KEY }}
+            SERVICES: ecr
+            DEFAULT_REGION: us-east-1
+          ports:
+            - 4566:4566
 
-      - name: Configurar Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      steps:
+        - name: Checkout del repo
+          uses: actions/checkout@v4
 
-      - name: Iniciar sesión en Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        - name: Iniciar sesión en Docker Hub
+          uses: docker/login-action@v3
+          with:
+            username: ${{ secrets.DOCKERHUB_USERNAME }}
+            password: ${{ secrets.DOCKERHUB_TOKEN }}
+            
+        - name: Instalar AWS CLI
+          run: |
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install
+            
+        - name: Instalar AWS CLI Local
+          run: |
+            pip install awscli-local
+            
+        - name: Crear repositorio en LocalStack ECR
+          run: |
+            awslocal ecr create-repository --repository-name app-inmobiliaria --region us-east-1
+            
+        - name: Obtener URI del repositorio
+          id: get-repository-uri
+          run: |
+            REPOSITORY_URI=$(awslocal ecr describe-repositories --repository-names app-inmobiliaria --region us-east-1 --query 'repositories[0].repositoryUri' --output text)
+            echo "repository_uri=$REPOSITORY_URI" >> $GITHUB_OUTPUT
+            
+        - name: Construir y publicar a Docker Hub
+          uses: docker/build-push-action@v6
+          with:
+            context: .
+            push: true
+            tags: ${{ secrets.DOCKERHUB_USERNAME }}/app-inmobiliaria:latest
 
-      - name: Construir y publicar en Docker Hub
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.DOCKER_IMAGE_NAME }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # Segundo job: Trabajar con LocalStack y desplegar en Kind
-  build-push-and-deploy:
-    needs: build-and-push-dockerhub
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    services:
-      localstack:
-        image: localstack/localstack-pro:latest
-        env:
-          LOCALSTACK_API_KEY: ${{ secrets.LOCALSTACK_API_KEY }}
-          SERVICES: ecr
-          DEFAULT_REGION: us-east-1
-        ports:
-          - 4566:4566
-
-    steps:
-      - name: Checkout del repositorio
-        uses: actions/checkout@v4
-
-      - name: Instalar las herramientas necesarias
-        run: |
-          pip install awscli-local
-          sudo apt-get update && sudo apt-get install -y jq
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64 && chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind
-          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-
-      - name: Esperar a que LocalStack instale
-        run: |
-          for i in {1..12}; do 
-            if curl -s http://localhost:4566/_localstack/health | jq -e '.services.ecr == "running"'; then 
-              echo "✅ ECR está listo!"; 
-              break; 
-            fi; 
-            echo "⏳ Esperando... intento $i/12"; 
-            sleep 10; 
-          done
-
-      - name: Crear repositorio ECR y obtener URI
-        id: ecr_repo
-        run: |
-          REPO_JSON=$(awslocal ecr create-repository --repository-name ${{ env.DOCKER_IMAGE_NAME }} --image-scanning-configuration scanOnPush=true)
-          URI=$(echo $REPO_JSON | jq -r '.repository.repositoryUri')
-          echo "✅ Repositorio ECR creado: $URI"
-          echo "uri=$URI" >> $GITHUB_OUTPUT
-
-      - name: Construir la imagen para ECR LocalStack
-        id: build_image
-        run: |
-          ECR_REPO_URI="${{ steps.ecr_repo.outputs.uri }}"
-          IMAGE_TAG="${{ github.sha }}"
+        - name: Build para LocalStack
+          run: |
+            docker build -t app-inmobiliaria:latest .
+            docker tag app-inmobiliaria:latest ${{ steps.get-repository-uri.outputs.repository_uri }}:latest
+            docker push ${{ steps.get-repository-uri.outputs.repository_uri }}:latest
+            
           
-          FULL_IMAGE_NAME="$ECR_REPO_URI:$IMAGE_TAG"
-          SIMPLE_KIND_NAME="${{ env.DOCKER_IMAGE_NAME }}:latest"
-          
-          echo "🔨 Construyendo imagen Docker..."
-          docker build -t "$FULL_IMAGE_NAME" -t "$SIMPLE_KIND_NAME" .
-          
-          echo "📤 Subiendo imagen a LocalStack ECR..."
-          awslocal ecr get-login-password | docker login --username AWS --password-stdin $ECR_REPO_URI
-          docker push "$FULL_IMAGE_NAME"
-          
-          echo "kind_image_name=$SIMPLE_KIND_NAME" >> $GITHUB_OUTPUT
-          echo "✅ Imagen subida exitosamente"
-
-      - name: Crear clúster de Kind
-        run: |
-          echo "🚀 Creando cluster Kind..."
-          kind create cluster --name test-cluster --wait 5m
-
-      - name: Cargar la imagen a los nodos de Kind
-        run: |
-          echo "📥 Cargando imagen en Kind..."
-          kind load docker-image ${{ steps.build_image.outputs.kind_image_name }} --name test-cluster
-          
-          # Verificar que la imagen se cargó correctamente
-          echo "🔍 Verificando imagen en Kind..."
-          docker exec test-cluster-control-plane crictl images | grep ${{ env.DOCKER_IMAGE_NAME }} || echo "⚠️ No se encontró la imagen"
-
-      - name: Crear manifiestos de Kubernetes
-        run: |
-          mkdir -p k8s
-          cat <<EOF > k8s/deployment.yaml
-          apiVersion: apps/v1
-          kind: Deployment
-          metadata:
-            name: ${{ env.DOCKER_IMAGE_NAME }}-deployment
-            labels:
-              app: ${{ env.DOCKER_IMAGE_NAME }}
-          spec:
-            replicas: 2
-            selector:
-              matchLabels:
-                app: ${{ env.DOCKER_IMAGE_NAME }}
-            template:
-              metadata:
-                labels:
-                  app: ${{ env.DOCKER_IMAGE_NAME }}
-              spec:
-                containers:
-                - name: ${{ env.DOCKER_IMAGE_NAME }}-container
-                  image: ${{ env.DOCKER_IMAGE_NAME }}:latest
-                  imagePullPolicy: Never
-                  ports:
-                  - containerPort: 3000
-                  resources:
-                    requests:
-                      memory: "64Mi"
-                      cpu: "250m"
-                    limits:
-                      memory: "128Mi"
-                      cpu: "500m"
-                  readinessProbe:
-                    httpGet:
-                      path: /health
-                      port: 3000
-                    initialDelaySeconds: 5
-                    periodSeconds: 5
-                  livenessProbe:
-                    httpGet:
-                      path: /health
-                      port: 3000
-                    initialDelaySeconds: 15
-                    periodSeconds: 20
-          ---
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: ${{ env.DOCKER_IMAGE_NAME }}-service
-          spec:
-            selector:
-              app: ${{ env.DOCKER_IMAGE_NAME }}
-            ports:
-            - port: 80
-              targetPort: 3000
-            type: ClusterIP
-          EOF
-
-      - name: Desplegar la aplicación en Kind
-        id: deploy
-        run: |
-          echo "🚀 Desplegando aplicación en Kubernetes..."
-          kubectl apply -f k8s/
-          
-          # Verificar que el deployment se creó correctamente
-          kubectl get deployment ${{ env.DOCKER_IMAGE_NAME }}-deployment
-          
-          # Esperar a que el deployment esté listo
-          kubectl rollout status deployment/${{ env.DOCKER_IMAGE_NAME }}-deployment --timeout=5m
-        continue-on-error: true
-
-      - name: Diagnóstico en caso de error
-        if: steps.deploy.outcome == 'failure'
-        run: |
-          echo "❌ Error en el despliegue. Información de diagnóstico:"
-          echo "=== Cluster info ==="
-          kubectl cluster-info || echo "No se pudo obtener info del cluster"
-          echo "=== Nodes ==="
-          kubectl get nodes -o wide || echo "No se pudieron obtener los nodos"
-          echo "=== Deployment ==="
-          kubectl describe deployment ${{ env.DOCKER_IMAGE_NAME }}-deployment || echo "No se pudo describir el deployment"
-          echo "=== Pods ==="
-          kubectl get pods -l app=${{ env.DOCKER_IMAGE_NAME }} || echo "No se pudieron obtener los pods"
-          kubectl describe pods -l app=${{ env.DOCKER_IMAGE_NAME }} || echo "No se pudieron describir los pods"
-          echo "=== Events ==="
-          kubectl get events --sort-by=.metadata.creationTimestamp || echo "No se pudieron obtener eventos"
-          echo "=== Images in Kind ==="
-          docker exec test-cluster-control-plane crictl images | grep ${{ env.DOCKER_IMAGE_NAME }} || echo "No se encontró la imagen en Kind"
-          echo "=== All images in Kind ==="
-          docker exec test-cluster-control-plane crictl images || echo "No se pudieron listar las imágenes"
-
-      - name: Verificar despliegue exitoso
-        if: steps.deploy.outcome == 'success'
-        run: |
-          echo "✅ Despliegue exitoso!"
-          kubectl get pods -l app=${{ env.DOCKER_IMAGE_NAME }} -o wide
-          kubectl get services
-          kubectl get endpoints
-
-      - name: Limpiar recursos
-        if: always()
-        run: |
-          echo "🧹 Limpiando recursos..."
-          kind delete cluster --name test-cluster || echo "No se pudo eliminar el cluster"
