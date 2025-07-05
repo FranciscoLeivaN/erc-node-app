@@ -52,15 +52,9 @@ jobs:
         env:
           LOCALSTACK_API_KEY: ${{ secrets.LOCALSTACK_API_KEY }}
           SERVICES: ecr
-          DEFAULT_REGION: ${{ env.AWS_DEFAULT_REGION }}
-          DEBUG: 1
+          DEFAULT_REGION: us-east-1
         ports:
           - 4566:4566
-        options: >-
-          --health-cmd="curl -f http://localhost:4566/_localstack/health || exit 1"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=3
 
     steps:
       - name: Checkout del repositorio
