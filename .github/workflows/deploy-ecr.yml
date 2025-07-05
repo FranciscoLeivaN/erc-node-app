@@ -114,6 +114,10 @@ jobs:
         run: |
           echo "📥 Cargando imagen en Kind..."
           kind load docker-image ${{ steps.build_image.outputs.kind_image_name }} --name test-cluster
+          
+          # Verificar que la imagen se cargó correctamente
+          echo "🔍 Verificando imagen en Kind..."
+          docker exec test-cluster-control-plane crictl images | grep ${{ env.DOCKER_IMAGE_NAME }} || echo "⚠️ No se encontró la imagen"
 
       - name: Crear manifiestos de Kubernetes
         run: |
@@ -138,6 +142,7 @@ jobs:
                 containers:
                 - name: ${{ env.DOCKER_IMAGE_NAME }}-container
                   image: ${{ env.DOCKER_IMAGE_NAME }}:latest
+                  imagePullPolicy: Never
                   ports:
                   - containerPort: 3000
                   resources:
@@ -178,8 +183,12 @@ jobs:
         run: |
           echo "🚀 Desplegando aplicación en Kubernetes..."
           kubectl apply -f k8s/
-          kubectl set image deployment/${{ env.DOCKER_IMAGE_NAME }}-deployment ${{ env.DOCKER_IMAGE_NAME }}-container=${{ steps.build_image.outputs.kind_image_name }}
-          kubectl rollout status deployment/${{ env.DOCKER_IMAGE_NAME }}-deployment --timeout=3m
+          
+          # Verificar que el deployment se creó correctamente
+          kubectl get deployment ${{ env.DOCKER_IMAGE_NAME }}-deployment
+          
+          # Esperar a que el deployment esté listo
+          kubectl rollout status deployment/${{ env.DOCKER_IMAGE_NAME }}-deployment --timeout=5m
         continue-on-error: true
 
       - name: Diagnóstico en caso de error
@@ -188,21 +197,27 @@ jobs:
           echo "❌ Error en el despliegue. Información de diagnóstico:"
           echo "=== Cluster info ==="
           kubectl cluster-info || echo "No se pudo obtener info del cluster"
+          echo "=== Nodes ==="
+          kubectl get nodes -o wide || echo "No se pudieron obtener los nodos"
           echo "=== Deployment ==="
           kubectl describe deployment ${{ env.DOCKER_IMAGE_NAME }}-deployment || echo "No se pudo describir el deployment"
           echo "=== Pods ==="
+          kubectl get pods -l app=${{ env.DOCKER_IMAGE_NAME }} || echo "No se pudieron obtener los pods"
           kubectl describe pods -l app=${{ env.DOCKER_IMAGE_NAME }} || echo "No se pudieron describir los pods"
           echo "=== Events ==="
           kubectl get events --sort-by=.metadata.creationTimestamp || echo "No se pudieron obtener eventos"
           echo "=== Images in Kind ==="
           docker exec test-cluster-control-plane crictl images | grep ${{ env.DOCKER_IMAGE_NAME }} || echo "No se encontró la imagen en Kind"
+          echo "=== All images in Kind ==="
+          docker exec test-cluster-control-plane crictl images || echo "No se pudieron listar las imágenes"
 
       - name: Verificar despliegue exitoso
         if: steps.deploy.outcome == 'success'
         run: |
           echo "✅ Despliegue exitoso!"
-          kubectl get pods -l app=${{ env.DOCKER_IMAGE_NAME }}
+          kubectl get pods -l app=${{ env.DOCKER_IMAGE_NAME }} -o wide
           kubectl get services
+          kubectl get endpoints
 
       - name: Limpiar recursos
         if: always()
