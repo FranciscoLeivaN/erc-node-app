@@ -28,15 +28,16 @@ jobs:
             username: ${{ secrets.DOCKERHUB_USERNAME }}
             password: ${{ secrets.DOCKERHUB_TOKEN }}
             
-        - name: Instalar AWS CLI
-          run: |
-            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-            unzip awscliv2.zip
-            sudo ./aws/install
-            
         - name: Instalar AWS CLI Local
           run: |
             pip install awscli-local
+            
+        - name: Configurar entorno para LocalStack
+          run: |
+            echo "AWS_ENDPOINT_URL=http://localhost:4566" >> $GITHUB_ENV
+            echo "AWS_ACCESS_KEY_ID=test" >> $GITHUB_ENV
+            echo "AWS_SECRET_ACCESS_KEY=test" >> $GITHUB_ENV
+            echo "AWS_DEFAULT_REGION=us-east-1" >> $GITHUB_ENV
             
         - name: Crear repositorio en LocalStack ECR
           run: |
@@ -48,6 +49,12 @@ jobs:
             REPOSITORY_URI=$(awslocal ecr describe-repositories --repository-names app-inmobiliaria --region us-east-1 --query 'repositories[0].repositoryUri' --output text)
             echo "repository_uri=$REPOSITORY_URI" >> $GITHUB_OUTPUT
             
+        - name: Iniciar sesión en LocalStack ECR
+          run: |
+            # Get LocalStack ECR auth token
+            AUTH_TOKEN=$(awslocal ecr get-authorization-token --output text --query 'authorizationData[].authorizationToken')
+            echo $AUTH_TOKEN | base64 -d | cut -d: -f2 | docker login --username AWS --password-stdin $(echo ${{ steps.get-repository-uri.outputs.repository_uri }} | cut -d/ -f1)
+            
         - name: Construir y publicar a Docker Hub
           uses: docker/build-push-action@v6
           with:
@@ -57,8 +64,14 @@ jobs:
 
         - name: Build para LocalStack
           run: |
-            docker build -t app-inmobiliaria:latest .
-            docker tag app-inmobiliaria:latest ${{ steps.get-repository-uri.outputs.repository_uri }}:latest
+            # Verificar que LocalStack está en ejecución
+            curl -s http://localhost:4566/health | grep "\"ecr\": \"running\""
+            
+            # Reutilizar la imagen ya construida de Docker Hub
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/app-inmobiliaria:latest
+            docker tag ${{ secrets.DOCKERHUB_USERNAME }}/app-inmobiliaria:latest ${{ steps.get-repository-uri.outputs.repository_uri }}:latest
+            
+            # Push a LocalStack ECR
             docker push ${{ steps.get-repository-uri.outputs.repository_uri }}:latest
             
           
